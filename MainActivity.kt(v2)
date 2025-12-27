@@ -1,0 +1,337 @@
+package com.example.automatictripended
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.os.Bundle
+import android.os.Looper
+import android.provider.ContactsContract
+import android.telephony.SmsManager
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.google.android.gms.location.*
+
+/* ---------- DATA MODEL ---------- */
+data class SavedTrip(
+    var name: String,
+    val lat: Double,
+    val lng: Double
+)
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationCallback: LocationCallback
+    private lateinit var locationRequest: LocationRequest
+
+    private var destinationLat: Double? = null
+    private var destinationLng: Double? = null
+    private var destinationName: String = ""
+
+    private var tripStarted = false
+    private var smsSent = false
+
+    private val selectedNumbers = mutableStateListOf<String>()
+    private val savedTrips = mutableStateListOf<SavedTrip>()
+    private var showTripsDialog by mutableStateOf(false)
+
+    companion object {
+        var latitude by mutableStateOf(0.0)
+        var longitude by mutableStateOf(0.0)
+        var currentDistance by mutableStateOf(0f)
+    }
+
+    /* ---------- CONTACT PICKER ---------- */
+    private val contactPicker =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                val cursor = result.data?.data?.let {
+                    contentResolver.query(
+                        it,
+                        arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                        null, null, null
+                    )
+                }
+
+                cursor?.use {
+                    if (it.moveToFirst()) {
+                        val number = it.getString(
+                            it.getColumnIndexOrThrow(
+                                ContactsContract.CommonDataKinds.Phone.NUMBER
+                            )
+                        ).replace(" ", "")
+                        if (!selectedNumbers.contains(number)) {
+                            selectedNumbers.add(number)
+                        }
+                    }
+                }
+            }
+        }
+
+    /* ---------- PERMISSIONS ---------- */
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
+            if (perms[Manifest.permission.ACCESS_FINE_LOCATION] == true &&
+                perms[Manifest.permission.SEND_SMS] == true
+            ) {
+                startLocationUpdates()
+            } else {
+                Toast.makeText(this, "Location & SMS permission required", Toast.LENGTH_LONG).show()
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        locationRequest = LocationRequest.Builder(
+            Priority.PRIORITY_HIGH_ACCURACY, 5000
+        ).setMinUpdateIntervalMillis(2000).build()
+
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.locations.forEach {
+                    latitude = it.latitude
+                    longitude = it.longitude
+                    checkDestinationReached(it)
+                }
+            }
+        }
+
+        requestPermissions()
+
+        setContent {
+            MaterialTheme {
+                TripUI()
+            }
+        }
+    }
+
+    /* ---------- UI ---------- */
+    @Composable
+    fun TripUI() {
+        var latInput by remember { mutableStateOf("") }
+        var lngInput by remember { mutableStateOf("") }
+        var nameInput by remember { mutableStateOf("") }
+
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("Trip Tracker", style = MaterialTheme.typography.headlineMedium)
+
+            Spacer(Modifier.height(16.dp))
+
+            OutlinedTextField(
+                value = nameInput,
+                onValueChange = { nameInput = it },
+                label = { Text("Destination Name") }
+            )
+
+            OutlinedTextField(
+                value = latInput,
+                onValueChange = { latInput = it },
+                label = { Text("Latitude") }
+            )
+
+            OutlinedTextField(
+                value = lngInput,
+                onValueChange = { lngInput = it },
+                label = { Text("Longitude") }
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(onClick = {
+                val intent = Intent(
+                    Intent.ACTION_PICK,
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+                )
+                contactPicker.launch(intent)
+            }) {
+                Text("SELECT CONTACTS (${selectedNumbers.size})")
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(onClick = {
+                destinationLat = latInput.toDoubleOrNull()
+                destinationLng = lngInput.toDoubleOrNull()
+                destinationName = nameInput.ifBlank { "My Destination" }
+
+                if (destinationLat == null || destinationLng == null || selectedNumbers.isEmpty()) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Set destination & select contacts",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@Button
+                }
+
+                // ✅ SAVE IMMEDIATELY (FIX)
+                saveTrip(destinationName, destinationLat!!, destinationLng!!)
+
+                tripStarted = true
+                smsSent = false
+
+                Toast.makeText(this@MainActivity, "Trip Started", Toast.LENGTH_SHORT).show()
+            }) {
+                Text("START TRIP")
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(onClick = {
+                loadTrips()
+                if (savedTrips.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "No previous trips", Toast.LENGTH_SHORT).show()
+                } else {
+                    showTripsDialog = true
+                }
+            }) {
+                Text("USE PREVIOUS TRIPS")
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text("Lat: $latitude")
+            Text("Lng: $longitude")
+            Text("Distance: ${"%.2f".format(currentDistance)} m")
+        }
+
+        /* ---------- PREVIOUS TRIPS DIALOG ---------- */
+        if (showTripsDialog) {
+            AlertDialog(
+                onDismissRequest = { showTripsDialog = false },
+                title = { Text("Previous Trips") },
+                text = {
+                    Column {
+                        savedTrips.forEach { trip ->
+                            var editedName by remember { mutableStateOf(trip.name) }
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedTextField(
+                                    value = editedName,
+                                    onValueChange = {
+                                        editedName = it
+                                        trip.name = it
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Button(onClick = {
+                                    destinationLat = trip.lat
+                                    destinationLng = trip.lng
+                                    destinationName = trip.name
+
+                                    tripStarted = true
+                                    smsSent = false
+                                    showTripsDialog = false
+
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "Using ${trip.name}",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }) {
+                                    Text("USE")
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = { showTripsDialog = false }) {
+                        Text("CLOSE")
+                    }
+                }
+            )
+        }
+    }
+
+    /* ---------- LOGIC ---------- */
+    private fun checkDestinationReached(current: Location) {
+        if (!tripStarted || smsSent || destinationLat == null || destinationLng == null) return
+
+        val dest = Location("dest").apply {
+            latitude = destinationLat!!
+            longitude = destinationLng!!
+        }
+
+        currentDistance = current.distanceTo(dest)
+
+        if (currentDistance <= 200) {
+            sendSmsToAll()
+            smsSent = true
+            tripStarted = false
+            Toast.makeText(this, "Trip Ended", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun sendSmsToAll() {
+        val message = "I reached $destinationName"
+        val sms = SmsManager.getDefault()
+        selectedNumbers.forEach {
+            sms.sendTextMessage(it, null, message, null, null)
+        }
+    }
+
+    /* ---------- STORAGE ---------- */
+    private fun saveTrip(name: String, lat: Double, lng: Double) {
+        val prefs = getSharedPreferences("trip_prefs", MODE_PRIVATE)
+        val set = prefs.getStringSet("trips", mutableSetOf()) ?: mutableSetOf()
+        set.add("$name|$lat|$lng")
+        prefs.edit().putStringSet("trips", set).apply()
+    }
+
+    private fun loadTrips() {
+        savedTrips.clear()
+        val prefs = getSharedPreferences("trip_prefs", MODE_PRIVATE)
+        prefs.getStringSet("trips", emptySet())?.forEach {
+            val p = it.split("|")
+            if (p.size == 3) {
+                savedTrips.add(SavedTrip(p[0], p[1].toDouble(), p[2].toDouble()))
+            }
+        }
+    }
+
+    /* ---------- LOCATION ---------- */
+    private fun requestPermissions() {
+        val list = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) list.add(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
+            != PackageManager.PERMISSION_GRANTED
+        ) list.add(Manifest.permission.SEND_SMS)
+
+        if (list.isNotEmpty()) permissionLauncher.launch(list.toTypedArray())
+        else startLocationUpdates()
+    }
+
+    private fun startLocationUpdates() {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        fusedLocationClient.requestLocationUpdates(
+            locationRequest, locationCallback, Looper.getMainLooper()
+        )
+    }
+}
